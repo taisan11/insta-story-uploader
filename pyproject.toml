@@ -7,5 +7,6 @@ requires-python = ">=3.13"
 dependencies = [
     "instagrapi>=2.2.1",
     "pillow>=10.0.0",
+    "pyinstaller>=6.17.0",
     "requests>=2.31.0",
 ]

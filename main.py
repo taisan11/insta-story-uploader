@@ -1,6 +1,8 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from instagrapi import Client
+from instagrapi.mixins import photo as ig_photo
+from instagrapi.story import StoryBuilder
 from instagrapi.types import StoryLink
 from PIL import Image, ImageTk
 import threading
@@ -10,6 +12,69 @@ from instagrapi.exceptions import LoginRequired, ChallengeRequired, TwoFactorReq
 import logging
 from typing import cast
 from pydantic import HttpUrl
+
+# Monkey patch: allow StoryBuilder(photo) that outputs MP4 to be routed to video upload
+_orig_photo_upload_to_story = ig_photo.UploadPhotoMixin.photo_upload_to_story
+
+
+def _patched_photo_upload_to_story(
+    self,
+    path: Path,
+    caption: str = "",
+    upload_id: str = "",
+    mentions=None,
+    locations=None,
+    links=None,
+    hashtags=None,
+    stickers=None,
+    medias=None,
+    polls=None,
+    extra_data=None,
+):
+    # Normalize optional lists to avoid mutable default pitfalls
+    mentions = mentions or []
+    locations = locations or []
+    links = links or []
+    hashtags = hashtags or []
+    stickers = stickers or []
+    medias = medias or []
+    polls = polls or []
+    extra_data = extra_data or {}
+
+    file_path = Path(path)
+    # If StoryBuilder produced an MP4 (e.g., due to processing), delegate to video upload
+    if file_path.suffix.lower() == ".mp4":
+        return self.video_upload_to_story(
+            file_path,
+            caption=caption,
+            mentions=mentions,
+            locations=locations,
+            links=links,
+            hashtags=hashtags,
+            stickers=stickers,
+            medias=medias,
+            polls=polls,
+            extra_data=extra_data,
+        )
+
+    return _orig_photo_upload_to_story(
+        self,
+        file_path,
+        caption=caption,
+        upload_id=upload_id,
+        mentions=mentions,
+        locations=locations,
+        links=links,
+        hashtags=hashtags,
+        stickers=stickers,
+        medias=medias,
+        polls=polls,
+        extra_data=extra_data,
+    )
+
+
+# Apply monkey patch
+ig_photo.UploadPhotoMixin.photo_upload_to_story = _patched_photo_upload_to_story
 
 class StoryUploader:
     def __init__(self, root):
@@ -21,11 +86,63 @@ class StoryUploader:
         self.cl.delay_range = [1, 4]
         self.logged_in = False
         self.selected_file_path = None
+        self.default_link_geom = {
+            "x": 0.5126011,
+            "y": 0.5168225,
+            "w": 0.50998676,
+            "h": 0.25875,
+        }
+        self.link_rows = []
         
         # セッションファイルの読み込みを試行
         self.load_session()
         
         self.setup_ui()
+
+    # Link Sticker UI helpers
+    def _create_link_row(self, index: int):
+        row = tk.Frame(self.link_rows_frame)
+        row.pack(fill=tk.X, pady=2)
+
+        tk.Label(row, text=f"Link {index}", width=7, anchor=tk.W, font=("Arial", 8)).pack(side=tk.LEFT)
+
+        url_entry = tk.Entry(row)
+        url_entry.insert(0, "https://")
+        url_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+
+        def add_field(label_text: str, key: str):
+            wrapper = tk.Frame(row)
+            wrapper.pack(side=tk.LEFT, padx=(0, 6))
+            tk.Label(wrapper, text=label_text, font=("Arial", 8)).pack(anchor=tk.W)
+            entry = tk.Entry(wrapper, width=8)
+            entry.insert(0, str(self.default_link_geom[key]))
+            entry.pack()
+            return entry
+
+        x_entry = add_field("X", "x")
+        y_entry = add_field("Y", "y")
+        w_entry = add_field("幅", "w")
+        h_entry = add_field("高さ", "h")
+
+        return {
+            "frame": row,
+            "url": url_entry,
+            "x": x_entry,
+            "y": y_entry,
+            "w": w_entry,
+            "h": h_entry,
+        }
+
+    def add_link_row(self):
+        row = self._create_link_row(len(self.link_rows) + 1)
+        self.link_rows.append(row)
+
+    def remove_link_row(self):
+        # 常に1行は残す
+        if len(self.link_rows) <= 1:
+            return
+        last = self.link_rows.pop()
+        last["frame"].destroy()
     
     def load_session(self):
         """保存されたセッションの読み込みを試行"""
@@ -94,20 +211,23 @@ class StoryUploader:
         self.preview_label = tk.Label(preview_frame, text="画像/動画が選択されていません", bg="lightgray")
         self.preview_label.pack(fill=tk.BOTH, expand=True)
         
-        # キャプション入力
-        caption_frame = tk.LabelFrame(main_frame, text="キャプション", padx=10, pady=10)
-        caption_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        self.caption_text = tk.Text(caption_frame, height=3, wrap=tk.WORD)
-        self.caption_text.pack(fill=tk.X)
-        
-        # リンク入力
-        link_frame = tk.LabelFrame(main_frame, text="リンク (オプション)", padx=10, pady=10)
+        # Link Sticker入力
+        link_frame = tk.LabelFrame(main_frame, text="Link Sticker (オプション)", padx=10, pady=10)
         link_frame.pack(fill=tk.X, pady=(0, 10))
         
-        self.link_entry = tk.Entry(link_frame)
-        self.link_entry.pack(fill=tk.X)
-        self.link_entry.insert(0, "https://")
+        link_info_label = tk.Label(link_frame, text="ストーリーに添付するリンク", fg="gray", font=("Arial", 8))
+        link_info_label.pack(anchor=tk.W, pady=(0, 5))
+        
+        self.link_rows_frame = tk.Frame(link_frame)
+        self.link_rows_frame.pack(fill=tk.X, pady=(0, 5))
+
+        controls = tk.Frame(link_frame)
+        controls.pack(anchor=tk.W, pady=(0, 5))
+        tk.Button(controls, text="＋", width=3, command=self.add_link_row).pack(side=tk.LEFT, padx=(0, 5))
+        tk.Button(controls, text="－", width=3, command=self.remove_link_row).pack(side=tk.LEFT)
+
+        # デフォルトで 1 行表示
+        self.add_link_row()
         
         # アップロードボタン
         upload_btn = tk.Button(main_frame, text="ストーリーをアップロード", 
@@ -245,10 +365,30 @@ class StoryUploader:
             messagebox.showerror("エラー", "ファイルを選択してください")
             return
         
-        caption = self.caption_text.get("1.0", tk.END).strip()
-        link = self.link_entry.get().strip()
-        if link == "https://":
-            link = ""
+        def collect_links():
+            links = []
+            for idx, row in enumerate(self.link_rows, start=1):
+                url = row["url"].get().strip()
+                if not url or url == "https://":
+                    continue
+                try:
+                    link_x = float(row["x"].get() or self.default_link_geom["x"])
+                    link_y = float(row["y"].get() or self.default_link_geom["y"])
+                    link_w = float(row["w"].get() or self.default_link_geom["w"])
+                    link_h = float(row["h"].get() or self.default_link_geom["h"])
+                except ValueError:
+                    messagebox.showerror("エラー", f"Link {idx} の位置とサイズは数値で入力してください")
+                    return None
+                links.append(
+                    StoryLink(
+                        webUri=cast(HttpUrl, url),
+                        x=link_x,
+                        y=link_y,
+                        width=link_w,
+                        height=link_h,
+                    )
+                )
+            return links
         
         def upload_thread():
             try:
@@ -260,20 +400,23 @@ class StoryUploader:
                 file_path = Path(self.selected_file_path)
                 ext = os.path.splitext(str(file_path))[1].lower()
                 
+                links = collect_links()
+                if links is None:
+                    return
+                
+                # StoryBuilderを使用してストーリーを構築
                 if ext in ['.jpg', '.jpeg', '.png']:
                     # 画像ストーリー
-                    links = [StoryLink(webUri=cast(HttpUrl, link))] if link else []
+                    story = StoryBuilder(file_path).photo()
                     self.cl.photo_upload_to_story(
-                        file_path,
-                        caption=caption,
+                        story.path,
                         links=links
                     )
                 elif ext == '.mp4':
                     # 動画ストーリー
-                    links = [StoryLink(webUri=cast(HttpUrl, link))] if link else []
+                    story = StoryBuilder(file_path).video()
                     self.cl.video_upload_to_story(
-                        file_path,
-                        caption=caption,
+                        story.path,
                         links=links
                     )
                 else:
@@ -286,11 +429,20 @@ class StoryUploader:
                 self.selected_file_path = None
                 self.file_label.config(text="ファイル未選択", fg="gray")
                 self.preview_label.config(image="", text="画像/動画が選択されていません")
-                self.caption_text.delete("1.0", tk.END)
-                self.link_entry.delete(0, tk.END)
-                self.link_entry.insert(0, "https://")
+                for row in self.link_rows:
+                    row["url"].delete(0, tk.END)
+                    row["url"].insert(0, "https://")
+                    row["x"].delete(0, tk.END)
+                    row["x"].insert(0, str(self.default_link_geom["x"]))
+                    row["y"].delete(0, tk.END)
+                    row["y"].insert(0, str(self.default_link_geom["y"]))
+                    row["w"].delete(0, tk.END)
+                    row["w"].insert(0, str(self.default_link_geom["w"]))
+                    row["h"].delete(0, tk.END)
+                    row["h"].insert(0, str(self.default_link_geom["h"]))
                 
             except Exception as e:
+                print(e)
                 self.status_label.config(text="アップロード失敗", fg="red")
                 messagebox.showerror("エラー", f"アップロード失敗: {str(e)}")
         

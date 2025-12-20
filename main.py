@@ -4,7 +4,7 @@ from instagrapi import Client
 from instagrapi.mixins import photo as ig_photo
 from instagrapi.story import StoryBuilder
 from instagrapi.types import StoryLink
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw
 import threading
 import os
 from pathlib import Path
@@ -12,6 +12,7 @@ from instagrapi.exceptions import LoginRequired, ChallengeRequired, TwoFactorReq
 import logging
 from typing import cast
 from pydantic import HttpUrl
+import tempfile
 
 # Monkey patch: allow StoryBuilder(photo) that outputs MP4 to be routed to video upload
 _orig_photo_upload_to_story = ig_photo.UploadPhotoMixin.photo_upload_to_story
@@ -80,12 +81,13 @@ class StoryUploader:
     def __init__(self, root):
         self.root = root
         self.root.title("Instagram Story Uploader")
-        self.root.geometry("600x500")
+        self.root.geometry("600x800")
         
         self.cl = Client()
         self.cl.delay_range = [1, 4]
         self.logged_in = False
         self.selected_file_path = None
+        self.status_text = "ログインしてください"
         self.default_link_geom = {
             "x": 0.5126011,
             "y": 0.5168225,
@@ -93,36 +95,111 @@ class StoryUploader:
             "h": 0.25875,
         }
         self.link_rows = []
+        self.preview_max_size = (320, 220)
+        resampling = getattr(Image, "Resampling", Image)
+        self.resample_filter = getattr(resampling, "LANCZOS", getattr(resampling, "BICUBIC", getattr(resampling, "NEAREST", 0)))
         
-        # セッションファイルの読み込みを試行
-        self.load_session()
-        
+        # UI 構築後にセッションを読み込み、表示を更新
         self.setup_ui()
+        self.load_session()
+        if hasattr(self, "status_label"):
+            self.status_label.config(
+                text=self.status_text,
+                fg="green" if self.logged_in else "blue",
+            )
 
     # Link Sticker UI helpers
     def _create_link_row(self, index: int):
         row = tk.Frame(self.link_rows_frame)
-        row.pack(fill=tk.X, pady=2)
+        row.pack(fill=tk.X, pady=4)
 
-        tk.Label(row, text=f"Link {index}", width=7, anchor=tk.W, font=("Arial", 8)).pack(side=tk.LEFT)
+        top = tk.Frame(row)
+        top.pack(fill=tk.X)
 
-        url_entry = tk.Entry(row)
+        tk.Label(top, text=f"Link {index}", width=6, anchor=tk.W, font=("Arial", 8)).pack(side=tk.LEFT)
+
+        url_entry = tk.Entry(top, width=28)
         url_entry.insert(0, "https://")
-        url_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        url_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
 
-        def add_field(label_text: str, key: str):
-            wrapper = tk.Frame(row)
+        icon_var = tk.StringVar(value="")
+
+        def choose_icon():
+            file_path = filedialog.askopenfilename(
+                title="Link用画像を選択",
+                filetypes=[
+                    ("画像ファイル", "*.png *.jpg *.jpeg *.webp"),
+                    ("PNG", "*.png"),
+                    ("JPEG", "*.jpg *.jpeg"),
+                    ("WEBP", "*.webp"),
+                ],
+            )
+            if file_path:
+                icon_var.set(file_path)
+                icon_label.config(text=os.path.basename(file_path))
+                self.refresh_preview()
+
+        icon_btn = tk.Button(top, text="画像選択", command=choose_icon)
+        icon_btn.pack(side=tk.LEFT, padx=(4, 4))
+        icon_label = tk.Label(top, text="(なし)", width=10, anchor=tk.W, font=("Arial", 8))
+        icon_label.pack(side=tk.LEFT)
+
+        bottom = tk.Frame(row)
+        bottom.pack(fill=tk.X, pady=(2, 0))
+
+        def add_field(label_text: str, key: str, width: int = 6):
+            wrapper = tk.Frame(bottom)
             wrapper.pack(side=tk.LEFT, padx=(0, 6))
             tk.Label(wrapper, text=label_text, font=("Arial", 8)).pack(anchor=tk.W)
-            entry = tk.Entry(wrapper, width=8)
+            entry = tk.Entry(wrapper, width=width)
             entry.insert(0, str(self.default_link_geom[key]))
             entry.pack()
             return entry
 
         x_entry = add_field("X", "x")
         y_entry = add_field("Y", "y")
-        w_entry = add_field("幅", "w")
-        h_entry = add_field("高さ", "h")
+
+        w_var = tk.DoubleVar(value=self.default_link_geom["w"])
+        h_var = tk.DoubleVar(value=self.default_link_geom["h"])
+
+        def on_scale_change(var, entry):
+            entry.delete(0, tk.END)
+            entry.insert(0, f"{var.get():.4f}")
+            self.refresh_preview()
+
+        def bind_entry(entry, var):
+            def _on_change(_event=None):
+                try:
+                    val = float(entry.get())
+                    var.set(val)
+                except ValueError:
+                    pass
+                self.refresh_preview()
+            entry.bind("<KeyRelease>", _on_change)
+            entry.bind("<FocusOut>", _on_change)
+
+        w_entry = add_field("幅", "w", width=7)
+        h_entry = add_field("高さ", "h", width=7)
+        bind_entry(w_entry, w_var)
+        bind_entry(h_entry, h_var)
+
+        w_scale = tk.Scale(bottom, from_=0.05, to=1.0, orient=tk.HORIZONTAL, resolution=0.01,
+                           variable=w_var, length=110, command=lambda _v: on_scale_change(w_var, w_entry))
+        w_scale.pack(side=tk.LEFT, padx=(0, 6))
+
+        h_scale = tk.Scale(bottom, from_=0.05, to=1.0, orient=tk.HORIZONTAL, resolution=0.01,
+                           variable=h_var, length=110, command=lambda _v: on_scale_change(h_var, h_entry))
+        h_scale.pack(side=tk.LEFT, padx=(0, 6))
+
+        def bind_url_refresh(entry_widget):
+            def _cb(_event=None):
+                self.refresh_preview()
+            entry_widget.bind("<KeyRelease>", _cb)
+            entry_widget.bind("<FocusOut>", _cb)
+
+        bind_url_refresh(url_entry)
+        bind_url_refresh(x_entry)
+        bind_url_refresh(y_entry)
 
         return {
             "frame": row,
@@ -131,11 +208,18 @@ class StoryUploader:
             "y": y_entry,
             "w": w_entry,
             "h": h_entry,
+            "w_var": w_var,
+            "h_var": h_var,
+            "w_scale": w_scale,
+            "h_scale": h_scale,
+            "icon_var": icon_var,
+            "icon_label": icon_label,
         }
 
     def add_link_row(self):
         row = self._create_link_row(len(self.link_rows) + 1)
         self.link_rows.append(row)
+        self.refresh_preview()
 
     def remove_link_row(self):
         # 常に1行は残す
@@ -143,6 +227,11 @@ class StoryUploader:
             return
         last = self.link_rows.pop()
         last["frame"].destroy()
+        self.refresh_preview()
+
+    def refresh_preview(self):
+        if self.selected_file_path:
+            self.show_preview(self.selected_file_path)
     
     def load_session(self):
         """保存されたセッションの読み込みを試行"""
@@ -192,7 +281,7 @@ class StoryUploader:
         
         # ステータス表示
         self.status_label = tk.Label(main_frame, text=self.status_text, fg="blue", font=("Arial", 10))
-        self.status_label.pack(pady=(0, 20))
+        self.status_label.pack(pady=(0, 0))
         
         # ファイル選択エリア
         file_frame = tk.LabelFrame(main_frame, text="ファイル選択", padx=10, pady=10)
@@ -205,8 +294,9 @@ class StoryUploader:
         select_btn.pack(side=tk.LEFT)
         
         # プレビューエリア
-        preview_frame = tk.LabelFrame(main_frame, text="プレビュー", padx=10, pady=10)
+        preview_frame = tk.LabelFrame(main_frame, text="プレビュー", padx=10, pady=10, height=240)
         preview_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        preview_frame.pack_propagate(False)
         
         self.preview_label = tk.Label(preview_frame, text="画像/動画が選択されていません", bg="lightgray")
         self.preview_label.pack(fill=tk.BOTH, expand=True)
@@ -225,6 +315,7 @@ class StoryUploader:
         controls.pack(anchor=tk.W, pady=(0, 5))
         tk.Button(controls, text="＋", width=3, command=self.add_link_row).pack(side=tk.LEFT, padx=(0, 5))
         tk.Button(controls, text="－", width=3, command=self.remove_link_row).pack(side=tk.LEFT)
+        tk.Button(controls, text="プレビュー更新", command=self.refresh_preview).pack(side=tk.LEFT, padx=(8, 0))
 
         # デフォルトで 1 行表示
         self.add_link_row()
@@ -343,9 +434,37 @@ class StoryUploader:
         if ext in ['.jpg', '.jpeg', '.png']:
             try:
                 image = Image.open(file_path)
-                # プレビューサイズに調整
-                image.thumbnail((200, 200))
-                photo = ImageTk.PhotoImage(image)
+                orig_w, orig_h = image.size
+                preview = image.copy()
+                preview.thumbnail(self.preview_max_size)
+
+                # 描画: Link Sticker 当たり判定（URLが入力されている行のみ）
+                draw = ImageDraw.Draw(preview)
+                preview_w, preview_h = preview.size
+                for row in self.link_rows:
+                    url = row["url"].get().strip()
+                    if not url or url == "https://":
+                        continue
+                    try:
+                        link_x = float(row["x"].get() or self.default_link_geom["x"])
+                        link_y = float(row["y"].get() or self.default_link_geom["y"])
+                        link_w = float(row["w"].get() or self.default_link_geom["w"])
+                        link_h = float(row["h"].get() or self.default_link_geom["h"])
+                    except ValueError:
+                        continue
+                    px_w = link_w * preview_w
+                    px_h = link_h * preview_h
+                    cx = link_x * preview_w
+                    cy = link_y * preview_h
+                    bbox = [
+                        cx - px_w / 2,
+                        cy - px_h / 2,
+                        cx + px_w / 2,
+                        cy + px_h / 2,
+                    ]
+                    draw.rectangle(bbox, outline="red", width=2)
+
+                photo = ImageTk.PhotoImage(preview)
                 self.preview_label.config(image=photo, text="")
                 self.preview_label.image = photo  # type: ignore
             except Exception as e:
@@ -365,8 +484,9 @@ class StoryUploader:
             messagebox.showerror("エラー", "ファイルを選択してください")
             return
         
-        def collect_links():
+        def collect_links_with_icons():
             links = []
+            overlays = []
             for idx, row in enumerate(self.link_rows, start=1):
                 url = row["url"].get().strip()
                 if not url or url == "https://":
@@ -388,7 +508,11 @@ class StoryUploader:
                         height=link_h,
                     )
                 )
-            return links
+                overlays.append({
+                    "icon_path": row["icon_var"].get().strip(),
+                    "geom": (link_x, link_y, link_w, link_h),
+                })
+            return links, overlays
         
         def upload_thread():
             try:
@@ -400,27 +524,150 @@ class StoryUploader:
                 file_path = Path(self.selected_file_path)
                 ext = os.path.splitext(str(file_path))[1].lower()
                 
-                links = collect_links()
-                if links is None:
+                link_result = collect_links_with_icons()
+                if link_result is None:
                     return
+                links, overlays = link_result
                 
                 # StoryBuilderを使用してストーリーを構築
-                if ext in ['.jpg', '.jpeg', '.png']:
-                    # 画像ストーリー
-                    story = StoryBuilder(file_path).photo()
+                temp_upload_path = None
+                if ext in ['.jpg', '.jpeg', '.png', '.webp']:
+                    # 画像に Link 用アイコンを合成（アイコン指定がある行のみ）
+                    composite_needed = any(item.get("icon_path") for item in overlays)
+                    target_path = file_path
+                    if composite_needed:
+                        try:
+                            with Image.open(file_path).convert("RGBA") as base:
+                                base_w, base_h = base.size
+                                canvas = base.copy()
+                                for item in overlays:
+                                    icon_path = item.get("icon_path")
+                                    if not icon_path:
+                                        continue
+                                    geom = item.get("geom") or (
+                                        self.default_link_geom["x"],
+                                        self.default_link_geom["y"],
+                                        self.default_link_geom["w"],
+                                        self.default_link_geom["h"],
+                                    )
+                                    link_x = float(geom[0])
+                                    link_y = float(geom[1])
+                                    link_w = float(geom[2])
+                                    link_h = float(geom[3])
+                                    try:
+                                        with Image.open(icon_path).convert("RGBA") as icon_img:
+                                            target_w = max(1, int(link_w * base_w))
+                                            target_h = max(1, int(link_h * base_h))
+                                            icon_resized = icon_img.resize((target_w, target_h), self.resample_filter)
+                                            cx = link_x * base_w
+                                            cy = link_y * base_h
+                                            paste_x = int(cx - target_w / 2)
+                                            paste_y = int(cy - target_h / 2)
+                                            canvas.alpha_composite(icon_resized, (paste_x, paste_y))
+                                    except Exception as e:
+                                        print(f"アイコン合成に失敗: {e}")
+                                        continue
+
+                                # 形式は元画像に合わせる（JPEGの場合はRGBに変換）
+                                suffix = file_path.suffix.lower()
+                                if suffix in [".jpg", ".jpeg"]:
+                                    canvas = canvas.convert("RGB")
+                                    suffix = ".jpg"
+                                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                                    canvas.save(tmp.name)
+                                    target_path = Path(tmp.name)
+                                    temp_upload_path = target_path
+
+                        except Exception as e:
+                            print(f"合成処理に失敗: {e}")
+
+                    story = StoryBuilder(target_path).photo()
                     self.cl.photo_upload_to_story(
                         story.path,
                         links=links
                     )
                 elif ext == '.mp4':
-                    # 動画ストーリー
-                    story = StoryBuilder(file_path).video()
+                    # 動画ストーリー（必要ならアイコンを焼き込み）
+                    target_video_path = file_path
+                    composite_needed = any(item.get("icon_path") for item in overlays)
+                    if composite_needed:
+                        try:
+                            try:
+                                from moviepy.editor import VideoFileClip, ImageClip, CompositeVideoClip
+                                from moviepy.video.fx.resize import resize as mp_resize
+                            except ImportError:
+                                messagebox.showerror("エラー", "moviepy が必要です。`uv pip install moviepy` を実行してください。")
+                                return
+
+                            base_clip = VideoFileClip(str(file_path))
+                            width, height = base_clip.size
+                            overlay_clips = []
+                            for item in overlays:
+                                icon_path = item.get("icon_path")
+                                if not icon_path:
+                                    continue
+                                geom = item.get("geom") or (
+                                    self.default_link_geom["x"],
+                                    self.default_link_geom["y"],
+                                    self.default_link_geom["w"],
+                                    self.default_link_geom["h"],
+                                )
+                                link_x = float(geom[0])
+                                link_y = float(geom[1])
+                                link_w = float(geom[2])
+                                link_h = float(geom[3])
+                                target_w = max(1, int(link_w * width))
+                                target_h = max(1, int(link_h * height))
+                                pos_x = link_x * width - target_w / 2
+                                pos_y = link_y * height - target_h / 2
+                                try:
+                                    icon_clip = ImageClip(icon_path)
+                                    icon_clip = mp_resize(icon_clip, newsize=(target_w, target_h))
+                                    icon_clip = icon_clip.set_duration(base_clip.duration).set_pos((pos_x, pos_y))
+                                    overlay_clips.append(icon_clip)
+                                except Exception as e:
+                                    print(f"動画アイコン合成に失敗: {e}")
+                                    continue
+
+                            if overlay_clips:
+                                composite = CompositeVideoClip([base_clip, *overlay_clips])
+                                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+                                    temp_upload_path = Path(tmp.name)
+                                audio_path = temp_upload_path.with_suffix(".m4a")
+                                composite.write_videofile(
+                                    str(temp_upload_path),
+                                    codec="libx264",
+                                    audio_codec="aac",
+                                    temp_audiofile=str(audio_path),
+                                    remove_temp=True,
+                                    verbose=False,
+                                    logger=None,
+                                )
+                                target_video_path = temp_upload_path
+                                composite.close()
+                                base_clip.close()
+                                for clip in overlay_clips:
+                                    try:
+                                        clip.close()
+                                    except Exception:
+                                        pass
+                            else:
+                                base_clip.close()
+                        except Exception as e:
+                            print(f"動画へのアイコン合成に失敗: {e}")
+
+                    story = StoryBuilder(target_video_path).video()
                     self.cl.video_upload_to_story(
                         story.path,
                         links=links
                     )
                 else:
                     raise ValueError("未対応のファイル形式です")
+                if temp_upload_path:
+                    try:
+                        temp_upload_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
                 
                 self.status_label.config(text="アップロード成功!", fg="green")
                 messagebox.showinfo("成功", "ストーリーをアップロードしました!")
@@ -440,6 +687,10 @@ class StoryUploader:
                     row["w"].insert(0, str(self.default_link_geom["w"]))
                     row["h"].delete(0, tk.END)
                     row["h"].insert(0, str(self.default_link_geom["h"]))
+                    row["w_var"].set(self.default_link_geom["w"])
+                    row["h_var"].set(self.default_link_geom["h"])
+                    row["icon_var"].set("")
+                    row["icon_label"].config(text="(なし)")
                 
             except Exception as e:
                 print(e)

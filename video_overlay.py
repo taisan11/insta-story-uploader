@@ -80,3 +80,25 @@ def render_video_with_icons(
             details = getattr(exc, "stderr", "") or str(exc)
             raise RuntimeError(f"動画の合成に失敗しました: {details}") from exc
         return result
+
+
+def create_video_thumbnail(video_path: Path) -> Path:
+    """Extract a JPEG cover frame without instagrapi's optional MoviePy."""
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        ok, frame = capture.read()
+    finally:
+        capture.release()
+    if not ok or frame is None:
+        raise ValueError("動画のサムネイルを生成できませんでした")
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp:
+        thumbnail = Path(temp.name)
+
+    try:
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        Image.fromarray(rgb).save(thumbnail, format="JPEG", quality=90)
+    except Exception:
+        thumbnail.unlink(missing_ok=True)
+        raise
+    return thumbnail

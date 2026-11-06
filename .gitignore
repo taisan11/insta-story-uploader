@@ -10,3 +10,6 @@ wheels/
 .venv
 session.json
 *.spec
+
+# Lockfile is regenerated on each OS when building native binaries.
+uv.lock

@@ -1,0 +1,139 @@
+name: Build and Release
+
+run-name: Release ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.2.0, or 5)"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check tag and prevent replacing releases
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "::error::Use a non-empty tag containing only letters, numbers, dots, hyphens and underscores."
+            exit 1
+          fi
+          git check-ref-format "refs/tags/$TAG"
+          existing="$(git ls-remote --tags origin "refs/tags/$TAG")"
+          if [[ -n "$existing" ]]; then
+            echo "::error::Tag $TAG already exists. Choose a new tag."
+            exit 1
+          fi
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows-x64
+          - os: ubuntu-24.04
+            target: linux-x64
+          - os: macos-15
+            target: macos-x64
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10
+        with:
+          version: "0.13.5"
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.13
+
+      - name: Install Linux GUI libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1 libglib2.0-0 libtk8.6
+
+      - name: Resolve and install dependencies
+        run: uv sync --python 3.13 --group build
+
+      - name: Verify instagrapi version
+        run: uv run --no-sync python -c "from importlib.metadata import version; assert version('instagrapi') == '3.2.3'"
+
+      - name: Build GUI bundle
+        run: >-
+          uv run --no-sync pyinstaller
+          --noconfirm --clean --onedir --windowed
+          --name InstaStoryUploader
+          --collect-all instagrapi
+          --collect-all curl_cffi
+          --collect-all imageio_ffmpeg
+          --collect-all cv2
+          main.py
+
+      - name: Package application
+        shell: bash
+        env:
+          ARCHIVE: insta-story-uploader-${{ matrix.target }}.zip
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            ditto -c -k --sequesterRsrc --keepParent dist/InstaStoryUploader.app "release/$ARCHIVE"
+          else
+            uv run --no-sync python -m zipfile -c "release/$ARCHIVE" dist/InstaStoryUploader
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: insta-story-uploader-${{ matrix.target }}
+          path: release/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: insta-story-uploader-*
+          merge-multiple: true
+          path: release
+
+      - name: Publish GitHub Release and tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          TARGET_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" release/*.zip \
+            --target "$TARGET_SHA" \
+            --title "$TAG" \
+            --generate-notes

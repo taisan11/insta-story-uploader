@@ -1,7 +1,7 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from instagrapi import Client
-from video_overlay import render_video_with_icons
+from video_overlay import create_video_thumbnail, render_video_with_icons
 from instagrapi.types import StoryLink
 from PIL import Image, ImageTk, ImageDraw
 import threading
@@ -451,6 +451,7 @@ class StoryUploader:
             return links, overlays
         
         def upload_thread():
+            temp_upload_path = None
             try:
                 self.status_label.config(text="アップロード中...")
                 
@@ -465,8 +466,7 @@ class StoryUploader:
                     return
                 links, overlays = link_result
                 
-                # StoryBuilderを使用してストーリーを構築
-                temp_upload_path = None
+                # アップロード用メディアを準備
                 if ext in ['.jpg', '.jpeg', '.png', '.webp']:
                     # 画像に Link 用アイコンを合成（アイコン指定がある行のみ）
                     composite_needed = any(item.get("icon_path") for item in overlays)
@@ -532,15 +532,17 @@ class StoryUploader:
                             target_video_path = rendered
                             temp_upload_path = rendered
 
-                    self.cl.video_upload_to_story(target_video_path, links=links)
+                    # Provide a JPEG thumbnail so instagrapi 3.2.x uses its
+                    # built-in MP4 parser instead of MoviePy for uploads.
+                    thumbnail_path = create_video_thumbnail(target_video_path)
+                    try:
+                        self.cl.video_upload_to_story(
+                            target_video_path, thumbnail=thumbnail_path, links=links
+                        )
+                    finally:
+                        thumbnail_path.unlink(missing_ok=True)
                 else:
                     raise ValueError("未対応のファイル形式です")
-                if temp_upload_path:
-                    try:
-                        temp_upload_path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                
                 self.status_label.config(text="アップロード成功!", fg="green")
                 messagebox.showinfo("成功", "ストーリーをアップロードしました!")
                 
@@ -568,7 +570,10 @@ class StoryUploader:
                 print(e)
                 self.status_label.config(text="アップロード失敗", fg="red")
                 messagebox.showerror("エラー", f"アップロード失敗: {str(e)}")
-        
+            finally:
+                if temp_upload_path is not None:
+                    temp_upload_path.unlink(missing_ok=True)
+
         threading.Thread(target=upload_thread, daemon=True).start()
 
 

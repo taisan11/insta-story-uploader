@@ -1,8 +1,7 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from instagrapi import Client
-from instagrapi.mixins import photo as ig_photo
-from instagrapi.story import StoryBuilder
+from video_overlay import create_video_thumbnail, render_video_with_icons
 from instagrapi.types import StoryLink
 from PIL import Image, ImageTk, ImageDraw
 import threading
@@ -13,69 +12,6 @@ import logging
 from typing import cast
 from pydantic import HttpUrl
 import tempfile
-
-# Monkey patch: allow StoryBuilder(photo) that outputs MP4 to be routed to video upload
-_orig_photo_upload_to_story = ig_photo.UploadPhotoMixin.photo_upload_to_story
-
-
-def _patched_photo_upload_to_story(
-    self,
-    path: Path,
-    caption: str = "",
-    upload_id: str = "",
-    mentions=None,
-    locations=None,
-    links=None,
-    hashtags=None,
-    stickers=None,
-    medias=None,
-    polls=None,
-    extra_data=None,
-):
-    # Normalize optional lists to avoid mutable default pitfalls
-    mentions = mentions or []
-    locations = locations or []
-    links = links or []
-    hashtags = hashtags or []
-    stickers = stickers or []
-    medias = medias or []
-    polls = polls or []
-    extra_data = extra_data or {}
-
-    file_path = Path(path)
-    # If StoryBuilder produced an MP4 (e.g., due to processing), delegate to video upload
-    if file_path.suffix.lower() == ".mp4":
-        return self.video_upload_to_story(
-            file_path,
-            caption=caption,
-            mentions=mentions,
-            locations=locations,
-            links=links,
-            hashtags=hashtags,
-            stickers=stickers,
-            medias=medias,
-            polls=polls,
-            extra_data=extra_data,
-        )
-
-    return _orig_photo_upload_to_story(
-        self,
-        file_path,
-        caption=caption,
-        upload_id=upload_id,
-        mentions=mentions,
-        locations=locations,
-        links=links,
-        hashtags=hashtags,
-        stickers=stickers,
-        medias=medias,
-        polls=polls,
-        extra_data=extra_data,
-    )
-
-
-# Apply monkey patch
-ig_photo.UploadPhotoMixin.photo_upload_to_story = _patched_photo_upload_to_story
 
 class StoryUploader:
     def __init__(self, root):
@@ -515,6 +451,7 @@ class StoryUploader:
             return links, overlays
         
         def upload_thread():
+            temp_upload_path = None
             try:
                 self.status_label.config(text="アップロード中...")
                 
@@ -529,8 +466,7 @@ class StoryUploader:
                     return
                 links, overlays = link_result
                 
-                # StoryBuilderを使用してストーリーを構築
-                temp_upload_path = None
+                # アップロード用メディアを準備
                 if ext in ['.jpg', '.jpeg', '.png', '.webp']:
                     # 画像に Link 用アイコンを合成（アイコン指定がある行のみ）
                     composite_needed = any(item.get("icon_path") for item in overlays)
@@ -581,94 +517,32 @@ class StoryUploader:
                         except Exception as e:
                             print(f"合成処理に失敗: {e}")
 
-                    story = StoryBuilder(target_path).photo()
-                    self.cl.photo_upload_to_story(
-                        story.path,
-                        links=links
-                    )
+                    # Upload the image directly: StoryBuilder in instagrapi 3.x
+                    # requires MoviePy 2.x even for still images.
+                    self.cl.photo_upload_to_story(target_path, links=links)
                 elif ext == '.mp4':
-                    # 動画ストーリー（必要ならアイコンを焼き込み）
+                    # Burn link icons into the video without MoviePy's
+                    # conflicting Pillow requirements.
                     target_video_path = file_path
-                    composite_needed = any(item.get("icon_path") for item in overlays)
-                    if composite_needed:
-                        try:
-                            try:
-                                from moviepy.editor import VideoFileClip, ImageClip, CompositeVideoClip
-                                from moviepy.video.fx.resize import resize as mp_resize
-                            except ImportError:
-                                messagebox.showerror("エラー", "moviepy が必要です。`uv pip install moviepy` を実行してください。")
-                                return
+                    if any(item.get("icon_path") for item in overlays):
+                        rendered = render_video_with_icons(
+                            file_path, overlays, self.resample_filter
+                        )
+                        if rendered is not None:
+                            target_video_path = rendered
+                            temp_upload_path = rendered
 
-                            base_clip = VideoFileClip(str(file_path))
-                            width, height = base_clip.size
-                            overlay_clips = []
-                            for item in overlays:
-                                icon_path = item.get("icon_path")
-                                if not icon_path:
-                                    continue
-                                geom = item.get("geom") or (
-                                    self.default_link_geom["x"],
-                                    self.default_link_geom["y"],
-                                    self.default_link_geom["w"],
-                                    self.default_link_geom["h"],
-                                )
-                                link_x = float(geom[0])
-                                link_y = float(geom[1])
-                                link_w = float(geom[2])
-                                link_h = float(geom[3])
-                                target_w = max(1, int(link_w * width))
-                                target_h = max(1, int(link_h * height))
-                                pos_x = link_x * width - target_w / 2
-                                pos_y = link_y * height - target_h / 2
-                                try:
-                                    icon_clip = ImageClip(icon_path)
-                                    icon_clip = mp_resize(icon_clip, newsize=(target_w, target_h))
-                                    icon_clip = icon_clip.set_duration(base_clip.duration).set_pos((pos_x, pos_y))
-                                    overlay_clips.append(icon_clip)
-                                except Exception as e:
-                                    print(f"動画アイコン合成に失敗: {e}")
-                                    continue
-
-                            if overlay_clips:
-                                composite = CompositeVideoClip([base_clip, *overlay_clips])
-                                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-                                    temp_upload_path = Path(tmp.name)
-                                audio_path = temp_upload_path.with_suffix(".m4a")
-                                composite.write_videofile(
-                                    str(temp_upload_path),
-                                    codec="libx264",
-                                    audio_codec="aac",
-                                    temp_audiofile=str(audio_path),
-                                    remove_temp=True,
-                                    verbose=False,
-                                    logger=None,
-                                )
-                                target_video_path = temp_upload_path
-                                composite.close()
-                                base_clip.close()
-                                for clip in overlay_clips:
-                                    try:
-                                        clip.close()
-                                    except Exception:
-                                        pass
-                            else:
-                                base_clip.close()
-                        except Exception as e:
-                            print(f"動画へのアイコン合成に失敗: {e}")
-
-                    story = StoryBuilder(target_video_path).video()
-                    self.cl.video_upload_to_story(
-                        story.path,
-                        links=links
-                    )
+                    # Provide a JPEG thumbnail so instagrapi 3.2.x uses its
+                    # built-in MP4 parser instead of MoviePy for uploads.
+                    thumbnail_path = create_video_thumbnail(target_video_path)
+                    try:
+                        self.cl.video_upload_to_story(
+                            target_video_path, thumbnail=thumbnail_path, links=links
+                        )
+                    finally:
+                        thumbnail_path.unlink(missing_ok=True)
                 else:
                     raise ValueError("未対応のファイル形式です")
-                if temp_upload_path:
-                    try:
-                        temp_upload_path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                
                 self.status_label.config(text="アップロード成功!", fg="green")
                 messagebox.showinfo("成功", "ストーリーをアップロードしました!")
                 
@@ -696,7 +570,10 @@ class StoryUploader:
                 print(e)
                 self.status_label.config(text="アップロード失敗", fg="red")
                 messagebox.showerror("エラー", f"アップロード失敗: {str(e)}")
-        
+            finally:
+                if temp_upload_path is not None:
+                    temp_upload_path.unlink(missing_ok=True)
+
         threading.Thread(target=upload_thread, daemon=True).start()
 
 

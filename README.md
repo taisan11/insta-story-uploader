@@ -4,7 +4,7 @@
 実行ファイルはGithub release(右の奴)に置いときます。
 ## 使い方
 左上のアカウントからログインしてください。その前にFireFox等(広告ブロッカーあり)でログインしとくとBANリスクが抑えられる可能性が高いです。
-jpgまたはmp4がアップロード可能です。必ず16:9のサイズにしてください。
+jpgまたはmp4がアップロード可能です。推奨サイズは縦長の9:16（720×1280など）です。
 キャプションとリンクを付けることが可能ですが、動作は未確認です。
 実際に他のスマホを使用してる人に確認してもらってください。
 
@@ -25,3 +25,13 @@ jpgまたはmp4がアップロード可能です。必ず16:9のサイズにし�
 ↑AIここまで
 
 最後にアップロードボタンを押してしばらく待ったら完成です!!
+
+## GitHub Actions からリリースする
+
+1. [Actions](https://github.com/taisan11/insta-story-uploader/actions/workflows/release.yml) の **Build and Release** を開く。
+2. **Run workflow** を選び、リリース元のブランチ（通常 `main`）を選ぶ。
+3. **tag** に新しいタグ（例: `5` または `v0.2.0`）を入力して実行する。
+
+Windows x64、Linux x64、macOS x64 向けのアプリをビルドし、全環境が成功すると、指定タグを新規作成して GitHub Release に ZIP を添付します。既存タグへの上書きはしません。ZIP を展開して実行してください（Windows では `InstaStoryUploader.exe`）。macOS のアプリは未署名です。
+
+Python 3.13 と `instagrapi==3.2.3` を使用します。依存関係は各 OS のビルド時に `uv sync` で解決し、`uv.lock` はコミットしません。動画へのリンクアイコン合成には同梱の FFmpeg を使用します。

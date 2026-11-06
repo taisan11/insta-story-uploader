@@ -81,6 +81,9 @@ jobs:
       - name: Verify instagrapi version
         run: uv run --no-sync python -c "from importlib.metadata import version; assert version('instagrapi') == '3.2.3'"
 
+      - name: Check source and import dependencies
+        run: uv run --no-sync python -c "import ast, pathlib; [ast.parse(pathlib.Path(p).read_text(encoding='utf-8')) for p in ('main.py', 'video_overlay.py')]; import main, video_overlay"
+
       - name: Build GUI bundle
         run: >-
           uv run --no-sync pyinstaller
